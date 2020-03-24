@@ -1,0 +1,143 @@
+name: 编译 OpenWrt-86
+
+on:
+  push:
+    branches: 
+      - master
+  release:
+      types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 校验本地文件
+        uses: actions/checkout@v1
+
+      - name: 安装编译环境
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d
+          sudo -E apt-get -y purge azure-cli ghc* zulu* hhvm llvm* firefox google* dotnet* powershell openjdk* mysql* php*
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install wget build-essential asciidoc binutils bzip2 gawk gettext git libncurses5-dev libz-dev patch unzip zlib1g-dev lib32gcc1 libc6-dev-i386 subversion flex uglifyjs git-core gcc-multilib p7zip p7zip-full msmtp libssl-dev texinfo libglib2.0-dev xmlto qemu-utils upx libelf-dev autoconf automake libtool autopoint device-tree-compiler
+          sudo ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+
+      - name: 下载源码
+        env:
+          VER: v19.07.2
+          URL: https://github.com/openwrt/openwrt/archive/
+        run: |
+          wget -q ${URL}${VER}.tar.gz
+          tar -zxf ${VER}.tar.gz
+          rm ${VER}.tar.gz
+          mv openwrt-* openwrt
+
+      - name: 自定义扩展文件
+        run: |
+          cd openwrt
+
+          # # # luci-app-passwall
+          # # cat >> feeds.conf.default <<EOF
+          # # src-git lienol https://github.com/Lienol/openwrt-package
+          # # EOF
+          
+          cd package
+          mkdir software
+
+          # luci-app-passwall
+          git clone https://github.com/Lienol/openwrt-package software/Lienol
+
+          # luci-theme-argon
+          git clone -b 19.07_stable https://github.com/jerrykuku/luci-theme-argon software/luci-theme-argon
+
+          # UnblockNeteaseMusicGo (包含后端和前端)
+          git clone https://github.com/cnsilvan/luci-app-unblockneteasemusic software/unblock-neteasemusic-go
+          ## $(STAGING_DIR_HOST)/bin/upx --lzma --best $(GO_PKG_BUILD_BIN_DIR)/UnblockNeteaseMusic
+          sed -i '/.*upx /d' software/unblock-neteasemusic-go/UnblockNeteaseMusic/Makefile
+
+          # smartdns
+          git clone https://github.com/getwin/openwrt-smartdns software/smartdns
+          ## git clone https://github.com/pymumu/luci-app-smartdns software/luci-app-smartdns
+          git clone -b dev-19.07 https://github.com/tty228/luci-app-smartdns software/luci-app-smartdns
+          # fix for compiling
+          sed -i 's/\.\.\/\.\.\/luci\.mk/\$(TOPDIR)\/feeds\/luci\/luci\.mk/g' software/luci-app-smartdns/Makefile
+
+          # KMS
+          git clone https://github.com/flytosky-f/openwrt-vlmcsd software/vlmcsd
+          # git clone https://github.com/flytosky-f/luci-app-vlmcsd software/luci-app-vlmcsd
+          svn checkout https://github.com/coolsnowwolf/lede/trunk/package/lean/luci-app-vlmcsd software/luci-app-vlmcsd
+
+          # udp2raw-tunnel
+          git clone https://github.com/getwin/openwrt-udp2raw software/udp2raw-tunnel
+          git clone https://github.com/qq523407234/luci-app-udp2raw software/luci-app-udp2raw
+          
+          # # OpenAppFilter
+          # git clone https://github.com/destan19/OpenAppFilter software/OpenAppFilter
+          
+          # flowoffload (依赖 pdnsd-alt)
+          svn checkout https://github.com/coolsnowwolf/lede/trunk/package/lean/shortcut-fe software/shortcut-fe
+          svn checkout https://github.com/coolsnowwolf/lede/trunk/package/lean/luci-app-sfe software/luci-app-sfe
+          svn checkout https://github.com/coolsnowwolf/lede/trunk/package/lean/luci-app-flowoffload software/luci-app-flowoffload
+
+      - name: 更新扩展环境
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 自定义配置
+        run: |
+          cd openwrt
+          # rm -f ./.config*
+          # touch ./.config
+
+          # 默认ip 主机名
+          # sed -i 's/192.168.1.1/192.168.50.1/g' package/base-files/files/bin/config_generate
+          sed -i "s/'OpenWrt'/'Route'/g" package/base-files/files/bin/config_generate
+
+          # update golang
+          rm -rf feeds/packages/lang/golang
+          svn checkout https://github.com/openwrt/packages/trunk/lang/golang feeds/packages/lang/golang
+
+          rm -f .config
+          cp ../config .config
+          # make defconfig
+
+      - name: 下载编译所需源码
+        run: |
+          cd openwrt
+          make download -j8
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: 进行多线程编译
+        run: |
+          cd openwrt
+          echo -e "$(nproc) thread build."
+          make -j$(nproc)
+
+      - name: 尝试单线程编译
+        if: failure()
+        run: |
+            cd openwrt
+            make -j1 V=s
+        continue-on-error: true
+
+      - name: 提取文件
+        if: always()
+        run: |
+          rm -rf ./firmware/
+          mkdir -p ./firmware/
+          find ./openwrt/bin/targets/ -name "*x86-64-*" | xargs -i mv -f {} ./firmware/
+
+      - name : 上传文件
+        if: always()
+        uses: actions/upload-artifact@master
+        with:
+          name: OpenWrtFirmware
+          path: firmware
